@@ -2,8 +2,14 @@ import streamlit as st
 import pandas as pd
 import pyproj
 import simplekml
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
-# --- CONFIGURATION ---
+# --- SETUP ---
+# User agent is required for the address-finder to work
+geolocator = Nominatim(user_agent="AucklandCouncilKMLTool")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+
 COLOR_MAP = {
     "all bores": "ffff0000", "bores": "ffff0000",
     "all consents": "ff00ffff", "consents": "ff00ffff",
@@ -19,20 +25,25 @@ def is_near_nz(lon, lat):
     return (160 < lon < 185) and (-50 < lat < -30)
 
 def get_smart_title(row, sheet_name):
-    """Refined title logic based on your specific Excel columns."""
+    """Trims the title to be clean and relevant."""
     s = sheet_name.lower()
-    if "hail" in s and 'PropertyAddress' in row:
-        return str(row['PropertyAddress'])
-    if "bore" in s and 'BORE_ID' in row:
-        return f"Bore {row['BORE_ID']}"
-    if "incident" in s and 'INCIDENTNUMBER' in row:
-        return f"Incident {row['INCIDENTNUMBER']}"
-    if "consent" in s and 'CONSENT_NUMBER' in row:
-        return f"Consent {row['CONSENT_NUMBER']}"
+    val = ""
     
-    for col in ['PropertyAddress', 'Location', 'ID', 'Reference']:
-        if col in row and pd.notna(row[col]): return str(row[col])
-    return "Feature"
+    if "hail" in s and 'PropertyAddress' in row:
+        val = str(row['PropertyAddress']).split("Henderson")[0].strip()
+    elif "bore" in s and 'BORE_ID' in row:
+        val = f"Bore {row['BORE_ID']}"
+    elif "incident" in s and 'INCIDENTNUMBER' in row:
+        val = f"Incident {row['INCIDENTNUMBER']}"
+    elif "consent" in s and 'CONSENT_NUMBER' in row:
+        val = f"Consent {row['CONSENT_NUMBER']}"
+    
+    if not val:
+        for col in ['PropertyAddress', 'Location', 'ID']:
+            if col in row and pd.notna(row[col]): 
+                val = str(row[col])
+                break
+    return val if val else "Site Detail"
 
 def process_excel_to_kml(uploaded_file):
     xl = pd.ExcelFile(uploaded_file)
@@ -54,53 +65,60 @@ def process_excel_to_kml(uploaded_file):
                    next((c for c in df.columns if 'address' in c.lower() or 'location' in c.lower()), None)
 
         for _, row in df.iterrows():
-            # Build Table
-            border = "0" if "hail" in lookup else "1"
-            html = f'<table border="{border}" style="font-family:sans-serif; font-size:12px; border-collapse:collapse; width:300px;">'
+            # Build Table (No border for HAIL)
+            is_hail = "hail" in lookup
+            html = f'<table border="{"0" if is_hail else "1"}" style="font-family:sans-serif; font-size:12px; border-collapse:collapse; width:300px;">'
             for col, val in row.items():
                 if pd.notna(val) and str(val).lower() != 'n/a':
                     html += f'<tr><td style="padding:4px; background:#eee; font-weight:bold;">{col}</td><td>{val}</td></tr>'
             html += "</table>"
 
-            # Create Point
-            pnt = folder.newpoint(name=get_smart_title(row, sheet_name), description=html)
-            pnt.style.iconstyle.color = target_color
-            pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
-
-            # --- THE "AFRICA-PROOF" LOGIC ---
             lon, lat = None, None
-            is_hail_sheet = "hail" in lookup
+            clean_addr = None
 
-            # Only try coordinates if it's NOT a HAIL sheet (HAIL data uses addresses)
-            if not is_hail_sheet:
+            # 1. TRY COORDINATES FIRST
+            try:
+                e_val = float(str(row[e_col]).replace(',', '')) if e_col and pd.notna(row[e_col]) else None
+                n_val = float(str(row[n_col]).replace(',', '')) if n_col and pd.notna(row[n_col]) else None
+                if e_val and n_val:
+                    lon, lat = nztm.transform(e_val, n_val)
+                    if not is_near_nz(lon, lat):
+                        lon, lat = nzmg.transform(e_val, n_val)
+            except: pass
+
+            # 2. TRY ADDRESS GEOCODING IF NO COORDS (Like HAIL sites)
+            if (not lon or not lat) and addr_col and pd.notna(row[addr_col]):
+                clean_addr = str(row[addr_col]).strip()
+                full_search = f"{clean_addr}, Auckland, New Zealand"
                 try:
-                    e_val = float(str(row[e_col]).replace(',', '')) if e_col and pd.notna(row[e_col]) else None
-                    n_val = float(str(row[n_col]).replace(',', '')) if n_col and pd.notna(row[n_col]) else None
-                    if e_val and n_val:
-                        lon, lat = nztm.transform(e_val, n_val)
-                        if not is_near_nz(lon, lat):
-                            lon, lat = nzmg.transform(e_val, n_val)
+                    # Attempt to find the house on the map via Python
+                    location = geolocator.geocode(full_search)
+                    if location:
+                        lon, lat = location.longitude, location.latitude
                 except: pass
 
-            # Placement
+            # 3. CREATE PLACEMARK
             if lon and lat and is_near_nz(lon, lat):
-                pnt.coords = [(lon, lat)]
-            elif addr_col and pd.notna(row[addr_col]):
-                # If we are here, we are using the address (HAIL sites end up here)
-                clean_addr = str(row[addr_col]).strip()
-                if "auckland" not in clean_addr.lower():
-                    clean_addr += ", Auckland, New Zealand"
-                pnt.address = clean_addr
-                # CRITICAL: If no coords, we must explicitly delete the 0,0 geometry
-                pnt.geometry = None 
+                pnt = folder.newpoint(name=get_smart_title(row, sheet_name), description=html, coords=[(lon, lat)])
+            elif clean_addr:
+                # Last resort: Add a point with NO coordinates so it doesn't go to Africa
+                pnt = folder.newpoint(name=get_smart_title(row, sheet_name), description=html)
+                pnt.address = f"{clean_addr}, Auckland, New Zealand"
+                pnt.geometry = None # Kills the 0,0 default
             else:
-                folder.features.remove(pnt)
+                continue
+
+            pnt.style.iconstyle.color = target_color
+            pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
+            pnt.style.iconstyle.scale = 0.8
 
     return kml.kml()
 
-# --- UI ---
+# --- STREAMLIT ---
 st.title("🌍 Auckland Council KML Pro")
+st.markdown("Geocoding address-only sites (like HAIL) to prevent points in Africa.")
 file = st.file_uploader("Upload Excel", type="xlsx")
 if file:
-    kml_str = process_excel_to_kml(file)
-    st.download_button("📥 Download KML", kml_str, file_name="Henderson_Map.kml")
+    with st.spinner("Geocoding addresses... This may take a moment."):
+        kml_str = process_excel_to_kml(file)
+        st.download_button("📥 Download KML", kml_str, file_name="Henderson_Report.kml")
