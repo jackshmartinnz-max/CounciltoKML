@@ -121,4 +121,9 @@ file = st.file_uploader("Upload Excel", type="xlsx")
 if file:
     with st.spinner("Geocoding addresses... This may take a moment."):
         kml_str = process_excel_to_kml(file)
-        st.download_button("📥 Download KML", kml_str, file_name="Henderson_Report.kml")
+        st.download_button(
+            "📥 Download KML",
+            kml_str.encode("utf-8"),
+            file_name="Henderson_Report.kml",
+            mime="application/vnd.google-earth.kml+xml",
+        )
