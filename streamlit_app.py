@@ -5,102 +5,121 @@ import simplekml
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 import re
+import io
 
 # --- CONFIGURATION ---
-# We set the timeout inside Nominatim, not the RateLimiter
-geolocator = Nominatim(user_agent="Auckland_Council_Mapper_Final", timeout=10)
-# RateLimiter adds a delay between requests to avoid being blocked
+geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v4", timeout=10)
 geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=0.8)
-
 nztm = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
 
 def is_near_nz(lon, lat):
-    """Ensures coordinates stay within the Auckland/NZ region."""
+    """Ensures coordinates stay within the Auckland/NZ region (No Africa)."""
     if lon is None or lat is None: return False
     return (160 < lon < 185) and (-48 < lat < -32)
 
-def get_smart_title(row, sheet_name):
-    """Finds the best ID or short address for the sidebar."""
-    for col in ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'Reference']:
+def get_smart_title(row):
+    """Finds best ID for the map sidebar."""
+    id_cols = ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'Reference', 'ID']
+    for col in id_cols:
         if col in row and pd.notna(row[col]): return str(row[col])
     
     addr_cols = [c for c in row.index if 'address' in c.lower() or 'location' in c.lower()]
     if addr_cols and pd.notna(row[addr_cols[0]]):
         return str(row[addr_cols[0]]).split(',')[0].strip()
-    return "Point"
+    return "Map Point"
 
-def process_excel(file):
+def process_project(file):
     xl = pd.ExcelFile(file)
     kml = simplekml.Kml()
+    failed_rows = []
+    stats = {"math": 0, "address": 0}
     
+    # Standard Council Colors
     COLOR_MAP = {
         "all bores": "ffff0000", "bores": "ffff0000",
         "all consents": "ff00ffff", "consents": "ff00ffff",
         "all incidents": "ff0000ff", "incidents": "ff0000ff",
         "hail": "ff800080"
     }
-    FALLBACK_PALETTE = ["ffffff00", "ff00a5ff", "ff008000", "ffffc0cb"]
-    color_index = 0
-
+    
     for sheet_name in xl.sheet_names:
         df = xl.parse(sheet_name)
-        lookup = sheet_name.strip().lower()
         folder = kml.newfolder(name=sheet_name)
         
-        target_color = COLOR_MAP.get(lookup, FALLBACK_PALETTE[color_index % len(FALLBACK_PALETTE)])
-        if lookup not in COLOR_MAP: color_index += 1
-
-        # Column Detection
-        e_col = next((c for c in df.columns if c.lower() in ['easting', 'nztmxcoord', 'x', 'east']), None)
-        n_col = next((c for c in df.columns if c.lower() in ['northing', 'nztmycoord', 'y', 'north']), None)
+        # IMPROVED COLUMN DETECTION: Added XCoord and YCoord
+        e_col = next((c for c in df.columns if c.lower() in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east']), None)
+        n_col = next((c for c in df.columns if c.lower() in ['northing', 'nztmycoord', 'ycoord', 'y', 'north']), None)
         addr_col = next((c for c in df.columns if 'address' in c.lower() or 'location' in c.lower()), None)
 
         for _, row in df.iterrows():
             lon, lat = None, None
+            found_by = None
             
-            # 1. TRY COORDINATE MATH FIRST (Instant)
+            # 1. Try Coordinate Math (Now catches X/Y)
             try:
-                if e_col and n_col and pd.notna(row[e_col]):
+                if e_col and n_col and pd.notna(row[e_col]) and pd.notna(row[n_col]):
                     e_val = float(str(row[e_col]).replace(',', ''))
                     n_val = float(str(row[n_col]).replace(',', ''))
                     lon, lat = nztm.transform(e_val, n_val)
+                    if is_near_nz(lon, lat):
+                        found_by = "math"
             except: pass
 
-            # 2. TRY GEOCODING IF NO MATH (The HAIL sites)
-            if not is_near_nz(lon, lat) and addr_col and pd.notna(row[addr_col]):
-                # Strip postcodes and add Auckland context
+            # 2. Try Geocoding (if math failed or coordinates were outside NZ)
+            if found_by != "math" and addr_col and pd.notna(row[addr_col]):
                 clean_addr = re.sub(r'\b\d{4}\b', '', str(row[addr_col]))
                 query = f"{clean_addr}, Auckland, New Zealand"
                 try:
                     location = geocode_service(query)
                     if location:
                         lon, lat = location.longitude, location.latitude
+                        if is_near_nz(lon, lat):
+                            found_by = "address"
                 except: pass
 
-            # 3. ONLY CREATE PIN IF WE HAVE VALID DATA
-            if is_near_nz(lon, lat):
+            # 3. Sort Results
+            if found_by:
+                stats[found_by] += 1
                 html = '<table border="1" style="font-family:sans-serif;font-size:12px;border-collapse:collapse;width:280px;">'
                 for col, val in row.items():
                     if pd.notna(val): html += f'<tr><td style="background:#eee;font-weight:bold;padding:3px;">{col}</td><td>{val}</td></tr>'
                 html += "</table>"
 
-                pnt = folder.newpoint(name=get_smart_title(row, sheet_name), description=html, coords=[(lon, lat)])
-                pnt.style.iconstyle.color = target_color
+                pnt = folder.newpoint(name=get_smart_title(row), description=html, coords=[(lon, lat)])
+                pnt.style.iconstyle.color = COLOR_MAP.get(sheet_name.lower().strip(), "ff00ff00") # Default green
                 pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
-                pnt.style.iconstyle.scale = 0.8
             else:
-                # If it's not in NZ and we can't find the address, we SKIP it.
-                # No more pins in Africa!
-                continue
+                row_dict = row.to_dict()
+                row_dict['Original_Sheet'] = sheet_name
+                row_dict['Reason_Failed'] = "Invalid X/Y and Address not found"
+                failed_rows.append(row_dict)
 
-    return kml.kml()
+    failed_df = pd.DataFrame(failed_rows)
+    output_excel = io.BytesIO()
+    if not failed_df.empty:
+        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+            failed_df.to_excel(writer, index=False)
+    
+    return kml.kml(), output_excel.getvalue(), stats, len(failed_rows)
 
+# --- UI ---
+st.set_page_config(page_title="AKL Council Mapper", layout="centered")
 st.title("🌍 Universal Auckland Council KML Tool")
-st.info("Addresses (HAIL) are being looked up automatically. This may take a minute.")
 
-file = st.file_uploader("Upload Excel", type="xlsx")
+file = st.file_uploader("Upload Council Export (Excel)", type="xlsx")
+
 if file:
-    with st.spinner("Geocoding addresses... please wait."):
-        kml_output = process_excel(file)
-        st.success("Complete! Only verified Auckland locations were mapped.")
-        st.download_button("📥 Download KML", kml_output, file_name="Auckland_Project.kml")
+    with st.spinner("Processing... Mapping via XCoord/YCoord and Addresses."):
+        kml_data, excel_data, stats, fail_count = process_project(file)
+        
+        st.success(f"Processing Complete!")
+        st.write(f"✅ **{stats['math']}** located via NZTM Coordinates (X/Y)")
+        st.write(f"📍 **{stats['address']}** located via Street Address")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("📥 Download KML Map", kml_data, file_name="Auckland_Map.kml", use_container_width=True)
+            
+        with col2:
+            if fail_count > 0:
+                st.download_button("⚠️ Download Failed Sites", excel_data, file_name="Review_Required.xlsx", use_container_width=True)
