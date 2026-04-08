@@ -8,25 +8,40 @@ import re
 import io
 
 # --- CONFIGURATION ---
-geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v4", timeout=10)
+geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v5", timeout=10)
 geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=0.8)
 nztm = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
 
 def is_near_nz(lon, lat):
-    """Ensures coordinates stay within the Auckland/NZ region (No Africa)."""
     if lon is None or lat is None: return False
     return (160 < lon < 185) and (-48 < lat < -32)
 
 def get_smart_title(row):
-    """Finds best ID for the map sidebar."""
     id_cols = ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'Reference', 'ID']
     for col in id_cols:
         if col in row and pd.notna(row[col]): return str(row[col])
-    
     addr_cols = [c for c in row.index if 'address' in c.lower() or 'location' in c.lower()]
     if addr_cols and pd.notna(row[addr_cols[0]]):
         return str(row[addr_cols[0]]).split(',')[0].strip()
     return "Map Point"
+
+def get_sheet_color(sheet_name):
+    """
+    Assigns colors based on keywords in the sheet name.
+    KML Colors are AABBGGRR (Alpha, Blue, Green, Red).
+    """
+    s = sheet_name.lower()
+    if "bore" in s:
+        return "ffff0000"  # Blue
+    if "consent" in s:
+        return "ff00ffff"  # Yellow
+    if "incident" in s or "pollution" in s:
+        return "ff0000ff"  # Red
+    if "hail" in s or "land use" in s:
+        return "ff800080"  # Purple
+    if "well" in s:
+        return "ff00ff00"  # Green
+    return "ff00a5ff"      # Orange (Default)
 
 def process_project(file):
     xl = pd.ExcelFile(file)
@@ -34,19 +49,14 @@ def process_project(file):
     failed_rows = []
     stats = {"math": 0, "address": 0}
     
-    # Standard Council Colors
-    COLOR_MAP = {
-        "all bores": "ffff0000", "bores": "ffff0000",
-        "all consents": "ff00ffff", "consents": "ff00ffff",
-        "all incidents": "ff0000ff", "incidents": "ff0000ff",
-        "hail": "ff800080"
-    }
-    
     for sheet_name in xl.sheet_names:
         df = xl.parse(sheet_name)
         folder = kml.newfolder(name=sheet_name)
         
-        # IMPROVED COLUMN DETECTION: Added XCoord and YCoord
+        # Get color based on sheet name keyword
+        target_color = get_sheet_color(sheet_name)
+        
+        # Universal Column Detection
         e_col = next((c for c in df.columns if c.lower() in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east']), None)
         n_col = next((c for c in df.columns if c.lower() in ['northing', 'nztmycoord', 'ycoord', 'y', 'north']), None)
         addr_col = next((c for c in df.columns if 'address' in c.lower() or 'location' in c.lower()), None)
@@ -55,7 +65,7 @@ def process_project(file):
             lon, lat = None, None
             found_by = None
             
-            # 1. Try Coordinate Math (Now catches X/Y)
+            # 1. Try Coordinate Math (X/Y or Easting/Northing)
             try:
                 if e_col and n_col and pd.notna(row[e_col]) and pd.notna(row[n_col]):
                     e_val = float(str(row[e_col]).replace(',', ''))
@@ -65,7 +75,7 @@ def process_project(file):
                         found_by = "math"
             except: pass
 
-            # 2. Try Geocoding (if math failed or coordinates were outside NZ)
+            # 2. Try Geocoding
             if found_by != "math" and addr_col and pd.notna(row[addr_col]):
                 clean_addr = re.sub(r'\b\d{4}\b', '', str(row[addr_col]))
                 query = f"{clean_addr}, Auckland, New Zealand"
@@ -77,7 +87,6 @@ def process_project(file):
                             found_by = "address"
                 except: pass
 
-            # 3. Sort Results
             if found_by:
                 stats[found_by] += 1
                 html = '<table border="1" style="font-family:sans-serif;font-size:12px;border-collapse:collapse;width:280px;">'
@@ -86,8 +95,9 @@ def process_project(file):
                 html += "</table>"
 
                 pnt = folder.newpoint(name=get_smart_title(row), description=html, coords=[(lon, lat)])
-                pnt.style.iconstyle.color = COLOR_MAP.get(sheet_name.lower().strip(), "ff00ff00") # Default green
+                pnt.style.iconstyle.color = target_color
                 pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
+                pnt.style.iconstyle.scale = 0.8
             else:
                 row_dict = row.to_dict()
                 row_dict['Original_Sheet'] = sheet_name
@@ -109,11 +119,11 @@ st.title("🌍 Universal Auckland Council KML Tool")
 file = st.file_uploader("Upload Council Export (Excel)", type="xlsx")
 
 if file:
-    with st.spinner("Processing... Mapping via XCoord/YCoord and Addresses."):
+    with st.spinner("Processing... Mapping via X/Y and Addresses."):
         kml_data, excel_data, stats, fail_count = process_project(file)
         
         st.success(f"Processing Complete!")
-        st.write(f"✅ **{stats['math']}** located via NZTM Coordinates (X/Y)")
+        st.write(f"✅ **{stats['math']}** located via X/Y Coordinates")
         st.write(f"📍 **{stats['address']}** located via Street Address")
         
         col1, col2 = st.columns(2)
