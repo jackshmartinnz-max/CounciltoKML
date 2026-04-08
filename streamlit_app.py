@@ -8,7 +8,7 @@ import re
 import io
 
 # --- CONFIGURATION ---
-geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v7", timeout=10)
+geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v8", timeout=10)
 geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=0.8)
 nztm = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
 
@@ -17,44 +17,24 @@ def is_near_nz(lon, lat):
     return (160 < lon < 185) and (-48 < lat < -32)
 
 def get_smart_title(row):
-    # Expanded ID list based on your Review file
     id_cols = ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'ConsentReference', 'Reference', 'ID']
-    for col in id_cols:
-        if col in row and pd.notna(row[col]): return str(row[col])
+    for col in row.index:
+        if any(x == str(col).strip() for x in id_cols):
+            if pd.notna(row[col]): return str(row[col])
     
     addr_cols = [c for c in row.index if any(x in str(c).lower() for x in ['address', 'location', 'primaryaddress'])]
     if addr_cols and pd.notna(row[addr_cols[0]]):
         return str(row[addr_cols[0]]).split(',')[0].strip()
     return "Point"
 
-def get_sheet_color(sheet_name):
-    s = sheet_name.lower()
-    if any(x in s for x in ["bore", "well"]): return "ffff0000"
-    if "consent" in s: return "ff00ffff"
-    if any(x in s for x in ["incident", "pollution"]): return "ff0000ff"
-    if any(x in s for x in ["hail", "characteristic", "contaminated"]): return "ff800080"
+def get_sheet_color(sheet_name, current_headers):
+    # Determine color by sheet name OR by the active headers (if it's a stacked table)
+    combined = (str(sheet_name) + " " + " ".join([str(h) for h in current_headers])).lower()
+    if any(x in combined for x in ["bore", "well"]): return "ffff0000"
+    if "consent" in combined: return "ff00ffff"
+    if any(x in combined for x in ["incident", "pollution"]): return "ff0000ff"
+    if any(x in combined for x in ["hail", "characteristic", "contaminated"]): return "ff800080"
     return "ff00a5ff"
-
-def clean_df_structure(df_raw):
-    """
-    Scans the dataframe to find where the actual headers start.
-    Handles rows with titles and columns that start with empty spaces.
-    """
-    keywords = {'xcoord', 'ycoord', 'easting', 'northing', 'x', 'y', 'east', 'north', 'sapsiteid', 'consent_number'}
-    
-    # Scan first 10 rows and 5 columns for a keyword
-    for r in range(min(10, len(df_raw))):
-        for c in range(min(5, len(df_raw.columns))):
-            val = str(df_raw.iloc[r, c]).lower().strip()
-            if val in keywords:
-                # Found the header! 
-                new_df = df_raw.iloc[r:].copy()
-                new_df.columns = new_df.iloc[0] # Set this row as header
-                new_df = new_df.iloc[1:] # Drop header row from data
-                # Remove completely empty columns/rows
-                new_df = new_df.dropna(axis=1, how='all').dropna(axis=0, how='all')
-                return new_df
-    return df_raw
 
 def process_project(file):
     xl = pd.ExcelFile(file)
@@ -62,60 +42,75 @@ def process_project(file):
     failed_rows = []
     stats = {"math": 0, "address": 0}
     
+    keywords = {'xcoord', 'ycoord', 'easting', 'northing', 'x', 'y', 'east', 'north', 'sapsiteid', 'consent_number', 'bore_id'}
+
     for sheet_name in xl.sheet_names:
         df_raw = xl.parse(sheet_name, header=None)
-        df = clean_df_structure(df_raw)
-        
         folder = kml.newfolder(name=sheet_name)
-        target_color = get_sheet_color(sheet_name)
         
-        # Robust Column Mapping (Handles spaces and case sensitivity)
-        cols = {str(c).lower().strip(): c for c in df.columns}
-        
-        e_key = next((k for k in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east'] if k in cols), None)
-        n_key = next((k for k in ['northing', 'nztmycoord', 'ycoord', 'y', 'north'] if k in cols), None)
-        addr_key = next((k for k in cols if 'address' in k or 'location' in k), None)
+        current_headers = None
+        current_cols = {}
 
-        for _, row in df.iterrows():
+        for i, row in df_raw.iterrows():
+            # Check if this row is a NEW header (for stacked tables)
+            row_clean = [str(v).lower().strip() for v in row.values if pd.notna(v)]
+            if any(key in row_clean for key in keywords):
+                current_headers = [str(v).strip() if pd.notna(v) else f"Col_{idx}" for idx, v in enumerate(row.values)]
+                current_cols = {str(h).lower().strip(): idx for idx, h in enumerate(current_headers)}
+                continue
+            
+            # If we haven't found a header yet, skip
+            if current_headers is None:
+                continue
+
+            # Process the data row using active headers
             lon, lat = None, None
             found_by = None
             
-            # 1. Coordinate Math
+            # Extract values safely
+            e_key = next((k for k in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east'] if k in current_cols), None)
+            n_key = next((k for k in ['northing', 'nztmycoord', 'ycoord', 'y', 'north'] if k in current_cols), None)
+            addr_key = next((k for k in current_cols if 'address' in k or 'location' in k), None)
+
+            # 1. Math
             try:
                 if e_key and n_key:
-                    e_val = float(str(row[cols[e_key]]).replace(',', '').strip())
-                    n_val = float(str(row[cols[n_key]]).replace(',', '').strip())
-                    # Auto-flip if East/North are swapped
-                    if e_val > 3000000: e_val, n_val = n_val, e_val
-                    
+                    e_val = float(str(row[current_cols[e_key]]).replace(',', '').strip())
+                    n_val = float(str(row[current_cols[n_key]]).replace(',', '').strip())
+                    if e_val > 3000000: e_val, n_val = n_val, e_val # Auto-flip
                     lon, lat = nztm.transform(e_val, n_val)
                     if is_near_nz(lon, lat): found_by = "math"
             except: pass
 
-            # 2. Geocoding
-            if not found_by and addr_key and pd.notna(row[cols[addr_key]]):
-                clean_addr = re.sub(r'\b\d{4}\b', '', str(row[cols[addr_key]]))
-                query = f"{clean_addr}, Auckland, NZ"
-                try:
-                    location = geocode_service(query)
-                    if location:
-                        lon, lat = location.longitude, location.latitude
-                        if is_near_nz(lon, lat): found_by = "address"
-                except: pass
+            # 2. Address
+            if not found_by and addr_key:
+                val = row[current_cols[addr_key]]
+                if pd.notna(val) and len(str(val)) > 5:
+                    query = f"{re.sub(r'\b\d{4}\b', '', str(val))}, Auckland, NZ"
+                    try:
+                        location = geocode_service(query)
+                        if location:
+                            lon, lat = location.longitude, location.latitude
+                            if is_near_nz(lon, lat): found_by = "address"
+                    except: pass
 
             if found_by:
                 stats[found_by] += 1
                 html = '<table border="1" style="font-family:sans-serif;font-size:12px;border-collapse:collapse;width:280px;">'
-                for col_name, val in row.items():
-                    if pd.notna(val) and str(col_name).lower() != 'nan':
+                for idx, col_name in enumerate(current_headers):
+                    val = row[idx]
+                    if pd.notna(val) and "Col_" not in str(col_name):
                         html += f'<tr><td style="background:#eee;font-weight:bold;padding:3px;">{col_name}</td><td>{val}</td></tr>'
                 html += "</table>"
                 
-                pnt = folder.newpoint(name=get_smart_title(row), description=html, coords=[(lon, lat)])
-                pnt.style.iconstyle.color = target_color
+                # Use current headers to create a temporary Series for the title logic
+                temp_row = pd.Series(row.values, index=current_headers)
+                pnt = folder.newpoint(name=get_smart_title(temp_row), description=html, coords=[(lon, lat)])
+                pnt.style.iconstyle.color = get_sheet_color(sheet_name, current_headers)
                 pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
             else:
-                row_dict = row.to_dict()
+                if row.dropna().empty: continue # Skip totally blank rows
+                row_dict = {current_headers[idx]: val for idx, val in enumerate(row.values) if idx < len(current_headers)}
                 row_dict['Original_Sheet'] = sheet_name
                 failed_rows.append(row_dict)
 
@@ -128,17 +123,17 @@ def process_project(file):
     return kml.kml(), output_excel.getvalue(), stats, len(failed_rows)
 
 # --- UI ---
-st.set_page_config(page_title="AKL Universal Mapper", layout="centered")
-st.title("🌍 Universal Auckland Council KML Tool")
-st.markdown("Precision mapping for messy Council exports.")
+st.set_page_config(page_title="AKL Multi-Table Mapper", layout="centered")
+st.title("🌍 Auckland Council Universal Mapper")
+st.info("New: This version handles multiple tables stacked in one sheet (Whenuapai style).")
 
 file = st.file_uploader("Upload Excel File", type="xlsx")
 if file:
-    with st.spinner("Deep scanning sheets for coordinates..."):
+    with st.spinner("Scanning for stacked tables and coordinates..."):
         kml_data, excel_data, stats, fail_count = process_project(file)
-        st.success(f"Mapping Complete! Found {stats['math']} via Math.")
+        st.success(f"Complete! Math: {stats['math']} | Address: {stats['address']}")
         
         c1, c2 = st.columns(2)
-        with c1: st.download_button("📥 Download KML Map", kml_data, file_name="Auckland_Map.kml", use_container_width=True)
+        with c1: st.download_button("📥 Download KML", kml_data, file_name="Auckland_Map.kml", use_container_width=True)
         with c2: 
-            if fail_count > 0: st.download_button("⚠️ Download Failed", excel_data, file_name="Review.xlsx", use_container_width=True)
+            if fail_count > 0: st.download_button("⚠️ Review Failures", excel_data, file_name="Review.xlsx", use_container_width=True)
