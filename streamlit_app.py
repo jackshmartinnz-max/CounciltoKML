@@ -8,7 +8,7 @@ import re
 import io
 
 # --- CONFIGURATION ---
-geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v8", timeout=10)
+geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v9", timeout=10)
 geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=0.8)
 nztm = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
 
@@ -28,7 +28,6 @@ def get_smart_title(row):
     return "Point"
 
 def get_sheet_color(sheet_name, current_headers):
-    # Determine color by sheet name OR by the active headers (if it's a stacked table)
     combined = (str(sheet_name) + " " + " ".join([str(h) for h in current_headers])).lower()
     if any(x in combined for x in ["bore", "well"]): return "ffff0000"
     if "consent" in combined: return "ff00ffff"
@@ -52,22 +51,17 @@ def process_project(file):
         current_cols = {}
 
         for i, row in df_raw.iterrows():
-            # Check if this row is a NEW header (for stacked tables)
             row_clean = [str(v).lower().strip() for v in row.values if pd.notna(v)]
             if any(key in row_clean for key in keywords):
                 current_headers = [str(v).strip() if pd.notna(v) else f"Col_{idx}" for idx, v in enumerate(row.values)]
                 current_cols = {str(h).lower().strip(): idx for idx, h in enumerate(current_headers)}
                 continue
             
-            # If we haven't found a header yet, skip
-            if current_headers is None:
-                continue
+            if current_headers is None: continue
 
-            # Process the data row using active headers
             lon, lat = None, None
             found_by = None
             
-            # Extract values safely
             e_key = next((k for k in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east'] if k in current_cols), None)
             n_key = next((k for k in ['northing', 'nztmycoord', 'ycoord', 'y', 'north'] if k in current_cols), None)
             addr_key = next((k for k in current_cols if 'address' in k or 'location' in k), None)
@@ -77,16 +71,17 @@ def process_project(file):
                 if e_key and n_key:
                     e_val = float(str(row[current_cols[e_key]]).replace(',', '').strip())
                     n_val = float(str(row[current_cols[n_key]]).replace(',', '').strip())
-                    if e_val > 3000000: e_val, n_val = n_val, e_val # Auto-flip
+                    if e_val > 3000000: e_val, n_val = n_val, e_val 
                     lon, lat = nztm.transform(e_val, n_val)
                     if is_near_nz(lon, lat): found_by = "math"
             except: pass
 
-            # 2. Address
+            # 2. Address (Fixed Syntax Error here)
             if not found_by and addr_key:
                 val = row[current_cols[addr_key]]
                 if pd.notna(val) and len(str(val)) > 5:
-                    query = f"{re.sub(r'\b\d{4}\b', '', str(val))}, Auckland, NZ"
+                    address_clean = re.sub(r'\b\d{4}\b', '', str(val))
+                    query = f"{address_clean}, Auckland, NZ"
                     try:
                         location = geocode_service(query)
                         if location:
@@ -98,18 +93,17 @@ def process_project(file):
                 stats[found_by] += 1
                 html = '<table border="1" style="font-family:sans-serif;font-size:12px;border-collapse:collapse;width:280px;">'
                 for idx, col_name in enumerate(current_headers):
-                    val = row[idx]
-                    if pd.notna(val) and "Col_" not in str(col_name):
-                        html += f'<tr><td style="background:#eee;font-weight:bold;padding:3px;">{col_name}</td><td>{val}</td></tr>'
+                    v = row[idx]
+                    if pd.notna(v) and "Col_" not in str(col_name):
+                        html += f'<tr><td style="background:#eee;font-weight:bold;padding:3px;">{col_name}</td><td>{v}</td></tr>'
                 html += "</table>"
                 
-                # Use current headers to create a temporary Series for the title logic
                 temp_row = pd.Series(row.values, index=current_headers)
                 pnt = folder.newpoint(name=get_smart_title(temp_row), description=html, coords=[(lon, lat)])
                 pnt.style.iconstyle.color = get_sheet_color(sheet_name, current_headers)
                 pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
             else:
-                if row.dropna().empty: continue # Skip totally blank rows
+                if row.dropna().empty: continue
                 row_dict = {current_headers[idx]: val for idx, val in enumerate(row.values) if idx < len(current_headers)}
                 row_dict['Original_Sheet'] = sheet_name
                 failed_rows.append(row_dict)
@@ -123,13 +117,12 @@ def process_project(file):
     return kml.kml(), output_excel.getvalue(), stats, len(failed_rows)
 
 # --- UI ---
-st.set_page_config(page_title="AKL Multi-Table Mapper", layout="centered")
+st.set_page_config(page_title="AKL Mapper v9", layout="centered")
 st.title("🌍 Auckland Council Universal Mapper")
-st.info("New: This version handles multiple tables stacked in one sheet (Whenuapai style).")
 
 file = st.file_uploader("Upload Excel File", type="xlsx")
 if file:
-    with st.spinner("Scanning for stacked tables and coordinates..."):
+    with st.spinner("Processing stacked tables..."):
         kml_data, excel_data, stats, fail_count = process_project(file)
         st.success(f"Complete! Math: {stats['math']} | Address: {stats['address']}")
         
