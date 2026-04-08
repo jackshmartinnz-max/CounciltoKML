@@ -8,7 +8,7 @@ import re
 import io
 
 # --- CONFIGURATION ---
-geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v6", timeout=10)
+geolocator = Nominatim(user_agent="Auckland_Universal_Mapper_v7", timeout=10)
 geocode_service = RateLimiter(geolocator.geocode, min_delay_seconds=0.8)
 nztm = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
 
@@ -17,33 +17,44 @@ def is_near_nz(lon, lat):
     return (160 < lon < 185) and (-48 < lat < -32)
 
 def get_smart_title(row):
-    id_cols = ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'Reference', 'ID']
+    # Expanded ID list based on your Review file
+    id_cols = ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'ConsentReference', 'Reference', 'ID']
     for col in id_cols:
         if col in row and pd.notna(row[col]): return str(row[col])
-    addr_cols = [c for c in row.index if 'address' in c.lower() or 'location' in c.lower()]
+    
+    addr_cols = [c for c in row.index if any(x in str(c).lower() for x in ['address', 'location', 'primaryaddress'])]
     if addr_cols and pd.notna(row[addr_cols[0]]):
         return str(row[addr_cols[0]]).split(',')[0].strip()
     return "Point"
 
 def get_sheet_color(sheet_name):
     s = sheet_name.lower()
-    if "bore" in s: return "ffff0000"  # Blue
-    if "consent" in s: return "ff00ffff"  # Yellow
-    if "incident" in s or "pollution" in s: return "ff0000ff"  # Red
-    if "hail" in s or "characteristic" in s: return "ff800080"  # Purple
-    return "ff00a5ff"  # Orange
+    if any(x in s for x in ["bore", "well"]): return "ffff0000"
+    if "consent" in s: return "ff00ffff"
+    if any(x in s for x in ["incident", "pollution"]): return "ff0000ff"
+    if any(x in s for x in ["hail", "characteristic", "contaminated"]): return "ff800080"
+    return "ff00a5ff"
 
-def find_actual_header(df_raw):
+def clean_df_structure(df_raw):
     """
-    Council files often have a title row before the headers.
-    This scans the first 5 rows for coordinate keywords.
+    Scans the dataframe to find where the actual headers start.
+    Handles rows with titles and columns that start with empty spaces.
     """
-    keywords = {'xcoord', 'ycoord', 'easting', 'northing', 'x', 'y', 'east', 'north'}
-    for i in range(min(5, len(df_raw))):
-        row_values = [str(val).lower() for val in df_raw.iloc[i].values if pd.notna(val)]
-        if any(key in row_values for key in keywords):
-            return i
-    return 0
+    keywords = {'xcoord', 'ycoord', 'easting', 'northing', 'x', 'y', 'east', 'north', 'sapsiteid', 'consent_number'}
+    
+    # Scan first 10 rows and 5 columns for a keyword
+    for r in range(min(10, len(df_raw))):
+        for c in range(min(5, len(df_raw.columns))):
+            val = str(df_raw.iloc[r, c]).lower().strip()
+            if val in keywords:
+                # Found the header! 
+                new_df = df_raw.iloc[r:].copy()
+                new_df.columns = new_df.iloc[0] # Set this row as header
+                new_df = new_df.iloc[1:] # Drop header row from data
+                # Remove completely empty columns/rows
+                new_df = new_df.dropna(axis=1, how='all').dropna(axis=0, how='all')
+                return new_df
+    return df_raw
 
 def process_project(file):
     xl = pd.ExcelFile(file)
@@ -52,38 +63,38 @@ def process_project(file):
     stats = {"math": 0, "address": 0}
     
     for sheet_name in xl.sheet_names:
-        # 1. Load raw to find the real header row
         df_raw = xl.parse(sheet_name, header=None)
-        header_row_index = find_actual_header(df_raw)
+        df = clean_df_structure(df_raw)
         
-        # 2. Reload with the correct header
-        df = xl.parse(sheet_name, skiprows=header_row_index)
         folder = kml.newfolder(name=sheet_name)
         target_color = get_sheet_color(sheet_name)
         
-        # Universal Column Detection
-        e_col = next((c for c in df.columns if str(c).lower() in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east']), None)
-        n_col = next((c for c in df.columns if str(c).lower() in ['northing', 'nztmycoord', 'ycoord', 'y', 'north']), None)
-        addr_col = next((c for c in df.columns if 'address' in str(c).lower() or 'location' in str(c).lower()), None)
+        # Robust Column Mapping (Handles spaces and case sensitivity)
+        cols = {str(c).lower().strip(): c for c in df.columns}
+        
+        e_key = next((k for k in ['easting', 'nztmxcoord', 'xcoord', 'x', 'east'] if k in cols), None)
+        n_key = next((k for k in ['northing', 'nztmycoord', 'ycoord', 'y', 'north'] if k in cols), None)
+        addr_key = next((k for k in cols if 'address' in k or 'location' in k), None)
 
         for _, row in df.iterrows():
             lon, lat = None, None
             found_by = None
             
-            # Coordinate Math
+            # 1. Coordinate Math
             try:
-                if e_col and n_col and pd.notna(row[e_col]) and pd.notna(row[n_col]):
-                    e_val = float(str(row[e_col]).replace(',', ''))
-                    n_val = float(str(row[n_col]).replace(',', ''))
-                    # Swap logic if accidentally reversed
-                    if e_val > 3000000: e_val, n_val = n_val, e_val 
+                if e_key and n_key:
+                    e_val = float(str(row[cols[e_key]]).replace(',', '').strip())
+                    n_val = float(str(row[cols[n_key]]).replace(',', '').strip())
+                    # Auto-flip if East/North are swapped
+                    if e_val > 3000000: e_val, n_val = n_val, e_val
+                    
                     lon, lat = nztm.transform(e_val, n_val)
                     if is_near_nz(lon, lat): found_by = "math"
             except: pass
 
-            # Geocoding Fallback
-            if found_by != "math" and addr_col and pd.notna(row[addr_col]):
-                clean_addr = re.sub(r'\b\d{4}\b', '', str(row[addr_col]))
+            # 2. Geocoding
+            if not found_by and addr_key and pd.notna(row[cols[addr_key]]):
+                clean_addr = re.sub(r'\b\d{4}\b', '', str(row[cols[addr_key]]))
                 query = f"{clean_addr}, Auckland, NZ"
                 try:
                     location = geocode_service(query)
@@ -95,9 +106,11 @@ def process_project(file):
             if found_by:
                 stats[found_by] += 1
                 html = '<table border="1" style="font-family:sans-serif;font-size:12px;border-collapse:collapse;width:280px;">'
-                for col, val in row.items():
-                    if pd.notna(val): html += f'<tr><td style="background:#eee;font-weight:bold;padding:3px;">{col}</td><td>{val}</td></tr>'
+                for col_name, val in row.items():
+                    if pd.notna(val) and str(col_name).lower() != 'nan':
+                        html += f'<tr><td style="background:#eee;font-weight:bold;padding:3px;">{col_name}</td><td>{val}</td></tr>'
                 html += "</table>"
+                
                 pnt = folder.newpoint(name=get_smart_title(row), description=html, coords=[(lon, lat)])
                 pnt.style.iconstyle.color = target_color
                 pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
@@ -117,13 +130,13 @@ def process_project(file):
 # --- UI ---
 st.set_page_config(page_title="AKL Universal Mapper", layout="centered")
 st.title("🌍 Universal Auckland Council KML Tool")
-st.info("Updated to handle multi-line headers (Whenuapai/Kauri Rd format).")
+st.markdown("Precision mapping for messy Council exports.")
 
-file = st.file_uploader("Upload Council Export", type="xlsx")
+file = st.file_uploader("Upload Excel File", type="xlsx")
 if file:
-    with st.spinner("Processing... Finding coordinates in multi-line sheets."):
+    with st.spinner("Deep scanning sheets for coordinates..."):
         kml_data, excel_data, stats, fail_count = process_project(file)
-        st.success(f"Mapping Complete! Math: {stats['math']} | Address: {stats['address']}")
+        st.success(f"Mapping Complete! Found {stats['math']} via Math.")
         
         c1, c2 = st.columns(2)
         with c1: st.download_button("📥 Download KML Map", kml_data, file_name="Auckland_Map.kml", use_container_width=True)
