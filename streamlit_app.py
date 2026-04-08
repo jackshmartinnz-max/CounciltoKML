@@ -8,7 +8,7 @@ from geopy.extra.rate_limiter import RateLimiter
 # --- SETUP ---
 # User agent is required for the address-finder to work
 geolocator = Nominatim(user_agent="AucklandCouncilKMLTool")
-geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+rate_limited_geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
 COLOR_MAP = {
     "all bores": "ffff0000", "bores": "ffff0000",
@@ -92,7 +92,7 @@ def process_excel_to_kml(uploaded_file):
                 full_search = f"{clean_addr}, Auckland, New Zealand"
                 try:
                     # Attempt to find the house on the map via Python
-                    location = geolocator.geocode(full_search)
+                    location = rate_limited_geocode(full_search)
                     if location:
                         lon, lat = location.longitude, location.latitude
                 except: pass
