@@ -4,11 +4,14 @@ import pyproj
 import simplekml
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
+import re
 
-# --- SETUP ---
-# User agent is required for the address-finder to work
-geolocator = Nominatim(user_agent="AucklandCouncilKMLTool")
-rate_limited_geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+# --- CONFIGURATION ---
+# The geographic "Box" for Auckland to prevent points jumping to other countries
+AKL_BOUNDS = [(-37.3, 174.4), (-36.3, 175.3)] 
+
+geolocator = Nominatim(user_agent="Auckland_Council_Project_Tool")
+geocode = RateLimiter(geolocator.geocode, min_delay_seconds=0.5, timeout=10)
 
 COLOR_MAP = {
     "all bores": "ffff0000", "bores": "ffff0000",
@@ -19,31 +22,29 @@ COLOR_MAP = {
 FALLBACK_PALETTE = ["ffffff00", "ff00a5ff", "ff008000", "ffffc0cb", "ff2222a2", "ff808080"]
 
 nztm = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
-nzmg = pyproj.Transformer.from_crs("epsg:27200", "epsg:4326", always_xy=True)
 
-def is_near_nz(lon, lat):
-    return (160 < lon < 185) and (-50 < lat < -30)
+def is_in_nz(lon, lat):
+    return (170 < lon < 179) and (-38 < lat < -34)
 
-def get_smart_title(row, sheet_name):
-    """Trims the title to be clean and relevant."""
-    s = sheet_name.lower()
-    val = ""
-    
-    if "hail" in s and 'PropertyAddress' in row:
-        val = str(row['PropertyAddress']).split("Henderson")[0].strip()
-    elif "bore" in s and 'BORE_ID' in row:
-        val = f"Bore {row['BORE_ID']}"
-    elif "incident" in s and 'INCIDENTNUMBER' in row:
-        val = f"Incident {row['INCIDENTNUMBER']}"
-    elif "consent" in s and 'CONSENT_NUMBER' in row:
-        val = f"Consent {row['CONSENT_NUMBER']}"
-    
-    if not val:
-        for col in ['PropertyAddress', 'Location', 'ID']:
-            if col in row and pd.notna(row[col]): 
-                val = str(row[col])
-                break
-    return val if val else "Site Detail"
+def clean_address_for_search(addr):
+    """Universal cleaner for NZ addresses."""
+    if not addr or pd.isna(addr): return None
+    s = str(addr)
+    # Remove 4-digit postcodes (e.g., 0612) which often break searches
+    s = re.sub(r'\b\d{4}\b', '', s)
+    # Remove "Waitakere", "Manukau" etc if they follow "Auckland" to simplify
+    s = s.replace("Waitakere", "").replace("Manukau", "").replace("North Shore", "")
+    return s.strip()
+
+def get_universal_title(row, sheet_name):
+    id_cols = ['BORE_ID', 'CONSENT_NUMBER', 'INCIDENTNUMBER', 'SAPSiteID', 'Reference']
+    for col in id_cols:
+        if col in row and pd.notna(row[col]):
+            return f"{row[col]}"
+    addr_col = next((c for c in row.index if 'address' in c.lower() or 'location' in c.lower()), None)
+    if addr_col:
+        return str(row[addr_col]).split("Auckland")[0].strip()
+    return "Map Point"
 
 def process_excel_to_kml(uploaded_file):
     xl = pd.ExcelFile(uploaded_file)
@@ -58,55 +59,49 @@ def process_excel_to_kml(uploaded_file):
         target_color = COLOR_MAP.get(lookup, FALLBACK_PALETTE[color_index % len(FALLBACK_PALETTE)])
         if lookup not in COLOR_MAP: color_index += 1
 
-        # Column Detection
-        e_col = next((c for c in df.columns if c.lower() in ['easting', 'nztmxcoord', 'x']), None)
-        n_col = next((c for c in df.columns if c.lower() in ['northing', 'nztmycoord', 'y']), None)
-        addr_col = 'PropertyAddress' if 'PropertyAddress' in df.columns else \
-                   next((c for c in df.columns if 'address' in c.lower() or 'location' in c.lower()), None)
+        # Universal Column Detection
+        e_col = next((c for c in df.columns if c.lower() in ['easting', 'nztmxcoord', 'x', 'east']), None)
+        n_col = next((c for c in df.columns if c.lower() in ['northing', 'nztmycoord', 'y', 'north']), None)
+        addr_col = next((c for c in df.columns if 'address' in c.lower() or 'location' in c.lower()), None)
 
         for _, row in df.iterrows():
-            # Build Table (No border for HAIL)
-            is_hail = "hail" in lookup
-            html = f'<table border="{"0" if is_hail else "1"}" style="font-family:sans-serif; font-size:12px; border-collapse:collapse; width:300px;">'
+            # Build Table
+            html = '<table border="1" style="font-family:sans-serif; font-size:12px; border-collapse:collapse; width:300px;">'
             for col, val in row.items():
                 if pd.notna(val) and str(val).lower() != 'n/a':
                     html += f'<tr><td style="padding:4px; background:#eee; font-weight:bold;">{col}</td><td>{val}</td></tr>'
             html += "</table>"
 
             lon, lat = None, None
-            clean_addr = None
-
-            # 1. TRY COORDINATES FIRST
+            
+            # 1. TRY COORDINATES (NZTM)
             try:
                 e_val = float(str(row[e_col]).replace(',', '')) if e_col and pd.notna(row[e_col]) else None
                 n_val = float(str(row[n_col]).replace(',', '')) if n_col and pd.notna(row[n_col]) else None
                 if e_val and n_val:
                     lon, lat = nztm.transform(e_val, n_val)
-                    if not is_near_nz(lon, lat):
-                        lon, lat = nzmg.transform(e_val, n_val)
             except: pass
 
-            # 2. TRY ADDRESS GEOCODING IF NO COORDS (Like HAIL sites)
+            # 2. TRY CLEANED ADDRESS SEARCH
             if (not lon or not lat) and addr_col and pd.notna(row[addr_col]):
-                clean_addr = str(row[addr_col]).strip()
-                full_search = f"{clean_addr}, Auckland, New Zealand"
+                search_addr = clean_address_for_search(row[addr_col])
+                query = f"{search_addr}, Auckland, New Zealand"
                 try:
-                    # Attempt to find the house on the map via Python
-                    location = rate_limited_geocode(full_search)
+                    location = geolocator.geocode(query, country_codes="nz", timeout=10)
                     if location:
                         lon, lat = location.longitude, location.latitude
                 except: pass
 
-            # 3. CREATE PLACEMARK
-            if lon and lat and is_near_nz(lon, lat):
-                pnt = folder.newpoint(name=get_smart_title(row, sheet_name), description=html, coords=[(lon, lat)])
-            elif clean_addr:
-                # Last resort: Add a point with NO coordinates so it doesn't go to Africa
-                pnt = folder.newpoint(name=get_smart_title(row, sheet_name), description=html)
-                pnt.address = f"{clean_addr}, Auckland, New Zealand"
-                pnt.geometry = None # Kills the 0,0 default
+            # 3. KML CREATION
+            pnt = folder.newpoint(name=get_universal_title(row, sheet_name), description=html)
+            if lon and lat and is_in_nz(lon, lat):
+                pnt.coords = [(lon, lat)]
+            elif addr_col and pd.notna(row[addr_col]):
+                # Fallback: Let Google Earth geocode it
+                pnt.address = f"{str(row[addr_col])}, Auckland, NZ"
+                pnt.geometry = None 
             else:
-                continue
+                folder.features.remove(pnt)
 
             pnt.style.iconstyle.color = target_color
             pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
@@ -114,16 +109,12 @@ def process_excel_to_kml(uploaded_file):
 
     return kml.kml()
 
-# --- STREAMLIT ---
-st.title("🌍 Auckland Council KML Pro")
-st.markdown("Geocoding address-only sites (like HAIL) to prevent points in Africa.")
+# --- STREAMLIT UI ---
+st.title("🌍 Universal Auckland Council KML Tool")
 file = st.file_uploader("Upload Excel", type="xlsx")
+
 if file:
-    with st.spinner("Geocoding addresses... This may take a moment."):
+    with st.spinner("Processing... This version uses cleaned addresses to improve accuracy."):
         kml_str = process_excel_to_kml(file)
-        st.download_button(
-            "📥 Download KML",
-            kml_str.encode("utf-8"),
-            file_name="Henderson_Report.kml",
-            mime="application/vnd.google-earth.kml+xml",
-        )
+        st.success("Complete!")
+        st.download_button("📥 Download KML", kml_str, file_name="Auckland_Project_Map.kml")
