@@ -2,50 +2,33 @@ import streamlit as st
 import pandas as pd
 import pyproj
 import simplekml
-from io import BytesIO
 
-# --- CONFIGURATION & REGISTRY ---
-REGISTRY = {
-    "all bores": {"type": "Boreholes", "color": "ffff0000"},       # Blue
-    "bores": {"type": "Boreholes", "color": "ffff0000"},
-    "all consents": {"type": "Discharge consents", "color": "ff00ffff"}, # Yellow
-    "all incidents": {"type": "Incidents / spills", "color": "ff0000ff"},# Red
-    "hail": {"type": "HAIL sites", "color": "ff800080"}            # Purple
-}
-FALLBACK_COLORS = ["ffffff00", "ff00a5ff", "ff008000", "ffffc0cb", "ff2222a2", "ff808080"]
-ICON_URL = "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png"
-
-# --- THE FIX: FORCED AXIS ORDER ---
-# EPSG:2193 is NZTM2000 (New). EPSG:27200 is NZMG (Old). 
-# always_xy=True ensures we always treat input as (Easting, Northing)
+# --- COORDINATE SYSTEM REGISTRY ---
+# NZTM2000 (New/Standard)
 nztm_transformer = pyproj.Transformer.from_crs("epsg:2193", "epsg:4326", always_xy=True)
+# NZMG (Old - used in legacy Council data)
+nzmg_transformer = pyproj.Transformer.from_crs("epsg:27200", "epsg:4326", always_xy=True)
+
+def is_near_auckland(lon, lat):
+    """Safety check to ensure points aren't in Africa or the ocean."""
+    return (170 < lon < 179) and (-39 < lat < -34)
 
 def process_excel_to_kml(uploaded_file):
     xl = pd.ExcelFile(uploaded_file)
     kml = simplekml.Kml()
-    color_index = 0
-
+    
     for sheet_name in xl.sheet_names:
         df = xl.parse(sheet_name)
-        lookup_name = sheet_name.strip().lower()
-        
-        # Routing
-        if lookup_name in REGISTRY:
-            color, d_type = REGISTRY[lookup_name]["color"], REGISTRY[lookup_name]["type"]
-        else:
-            color, d_type = FALLBACK_COLORS[color_index % len(FALLBACK_COLORS)], "Other"
-            color_index += 1
-
         folder = kml.newfolder(name=sheet_name)
 
-        # Better Column Detection (looks for E/N or X/Y)
-        e_col = next((c for c in df.columns if c.lower() in ['easting', 'eastings', 'x', 'east']), None)
-        n_col = next((c for c in df.columns if c.lower() in ['northing', 'northings', 'y', 'north']), None)
+        # Robust Column Search
+        e_col = next((c for c in df.columns if c.lower() in ['easting', 'eastings', 'x', 'east', 'nzte', 'mge']), None)
+        n_col = next((c for c in df.columns if c.lower() in ['northing', 'northings', 'y', 'north', 'nztn', 'mgn']), None)
         addr_col = next((c for c in df.columns if 'address' in c.lower()), None)
 
         for _, row in df.iterrows():
-            # Build HTML Table
-            border = "0" if d_type == "HAIL sites" else "1"
+            # Create Table (HAIL logic included)
+            border = "0" if "hail" in sheet_name.lower() else "1"
             html = f'<table border="{border}" style="font-family:sans-serif; font-size:12px; border-collapse:collapse; width:300px;">'
             for col, val in row.items():
                 if pd.notna(val):
@@ -54,30 +37,45 @@ def process_excel_to_kml(uploaded_file):
 
             pnt = folder.newpoint(description=html)
             pnt.name = str(row.get('ID', row.get('Reference', 'Point')))
-            pnt.style.iconstyle.icon.href = ICON_URL
-            pnt.style.iconstyle.color = color
-            pnt.style.iconstyle.scale = 0.8
+            pnt.style.iconstyle.icon.href = "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
+            pnt.style.iconstyle.scale = 0.7
 
-            # COORDINATE PROCESSING
+            # --- THE CONVERSION LOGIC ---
+            lon, lat = None, None
             try:
-                e_val = pd.to_numeric(row[e_col], errors='coerce') if e_col else None
-                n_val = pd.to_numeric(row[n_col], errors='coerce') if n_col else None
+                e_val = float(str(row[e_col]).replace(',', '')) if e_col else None
+                n_val = float(str(row[n_col]).replace(',', '')) if n_col else None
 
                 if e_val and n_val:
-                    # TRANSFORM: Input Easting(X), Northing(Y) -> Output Lon, Lat
+                    # Try NZTM First (Most likely)
                     lon, lat = nztm_transformer.transform(e_val, n_val)
-                    pnt.coords = [(lon, lat)]
-                elif addr_col and pd.notna(row[addr_col]):
-                    pnt.address = f"{row[addr_col]}, Auckland, New Zealand"
-            except Exception:
-                continue
+                    
+                    # If it lands in Africa, try the Old NZMG system
+                    if not is_near_auckland(lon, lat):
+                        lon, lat = nzmg_transformer.transform(e_val, n_val)
+            except:
+                pass
+
+            # Apply Location
+            if lon and lat and is_near_auckland(lon, lat):
+                pnt.coords = [(lon, lat)]
+            elif addr_col and pd.notna(row[addr_col]):
+                pnt.address = f"{row[addr_col]}, Auckland, New Zealand"
+            else:
+                # If everything fails, delete this empty point to avoid 0,0 Africa errors
+                folder.features.remove(pnt)
 
     return kml.kml()
 
 # --- STREAMLIT UI ---
-st.title("🌍 Auckland KML Generator (Fixed Projection)")
-uploaded_file = st.file_uploader("Upload Excel", type="xlsx")
+st.set_page_config(page_title="Auckland KML Pro", page_icon="🌍")
+st.title("🌍 Auckland Council KML Generator")
+st.write("Specialized for NZTM/NZMG Coordinate Conversions")
 
-if uploaded_file:
-    kml_output = process_excel_to_kml(uploaded_file)
-    st.download_button("📥 Download KML", kml_output, file_name="Auckland_Map.kml")
+file = st.file_uploader("Upload Henderson/Auckland Excel", type="xlsx")
+
+if file:
+    with st.spinner("Converting..."):
+        kml_str = process_excel_to_kml(file)
+        st.success("Conversion Complete!")
+        st.download_button("📥 Download KML", kml_str, file_name="Henderson_Project.kml")
